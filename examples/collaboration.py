@@ -1,7 +1,10 @@
-"""Two local participants share submit/wait; only one optionally uses an LLM.
+"""Runtime smoke check with scripted decisions; no LLM is called by default.
 
-uv run python examples/collaboration.py
-uv run --extra live python examples/collaboration.py --live
+After installing the environment:
+uv run --offline --no-sync python examples/collaboration.py
+
+Use a real model instead (requires TOKENHUB_API_KEY and provider access):
+uv run --extra live --no-dev python examples/collaboration.py --live
 """
 
 from __future__ import annotations
@@ -54,5 +57,6 @@ async def main(live=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--live", action="store_true",
+                        help="Use TokenHub DeepSeek instead of scripted decisions; requires TOKENHUB_API_KEY")
     asyncio.run(main(parser.parse_args().live))
