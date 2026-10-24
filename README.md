@@ -8,9 +8,11 @@ A small, message-driven runtime for LLM loops. Aether provides asynchronous subm
 
 ## Run with a real LLM
 
-From a source checkout, install the optional HTTP adapter:
+Clone the repository and install the optional HTTP adapter:
 
 ```bash
+git clone https://github.com/ruifengc/aether.git
+cd aether
 uv sync --extra live --no-dev
 ```
 

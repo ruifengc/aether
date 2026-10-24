@@ -8,9 +8,11 @@
 
 ## 使用真实 LLM
 
-在源码目录中安装可选 HTTP 适配器：
+克隆仓库并安装可选 HTTP 适配器：
 
 ```bash
+git clone https://github.com/ruifengc/aether.git
+cd aether
 uv sync --extra live --no-dev
 ```
 

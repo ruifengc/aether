@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/ruifengc/aether"
+Issues = "https://github.com/ruifengc/aether/issues"
+
 [project.optional-dependencies]
 live = ["httpx>=0.28,<1"]
 
