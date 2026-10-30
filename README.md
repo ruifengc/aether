@@ -6,6 +6,8 @@ A small, message-driven runtime for LLM loops. Aether provides asynchronous subm
 
 [API reference (Chinese)](docs/api.md) · [Architecture (Chinese)](docs/architecture.md) · [Collaboration example](examples/collaboration.py)
 
+Run snapshots include maximum, used and remaining decision, tool, summary and recovery budgets; the default adapter forwards them to the model. Rejected tool batches can be corrected within the same bounded recovery allowance. Successful summary fragments are reused during recovery until input changes or compaction completes. An optional [scripted review example](examples/reviewed_research.py) shares one run's budget across generation, review and revision; it makes no real model requests. See [model workflows (Chinese)](docs/model-workflows.md) for composition and adapter boundaries.
+
 ## Run with a real LLM
 
 Clone the repository and install the optional HTTP adapter:
@@ -108,7 +110,7 @@ bash scripts/check.sh
 uv build
 ```
 
-Checks cover worktree and index credential scans, Ruff, 105 runtime and tool tests, and the scripted collaboration example. They do not require the CLI or the original experiment workspace. Initial dependency installation may need network access; these checks make no model requests. Source distributions include both READMEs, documentation, examples, tests and check scripts.
+Checks cover worktree and index credential scans, Ruff, runtime and tool tests, and the scripted collaboration and review examples. They do not require the CLI or the original experiment workspace. Initial dependency installation may need network access; these checks make no model requests. Source distributions include both READMEs, documentation, examples, tests and check scripts.
 
 Context budgets use `ContextPolicy(input_bytes=24000, summary_bytes=1200, overhead_bytes=2048)`: conservative UTF-8 byte counts. Model output limits (`max_tokens`/`max_output_tokens`) and actual `usage` remain token counts.
 

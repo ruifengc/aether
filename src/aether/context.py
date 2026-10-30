@@ -31,14 +31,17 @@ class ContextPolicy:
         if self.input_bytes <= self.overhead_bytes + 2 * self.summary_bytes + 512:
             raise ValueError("input allowance must leave space for summary and messages")
 
-    def size(self, context: dict, tools: list, pending: list, feedback: str = "",
-             completed: list | None = None, system_prompt: str = "") -> int:
+    def size(self, context: dict, tools: list, pending: list, feedback: str | dict = "",
+             completed: list | None = None, system_prompt: str = "", *,
+             budget: dict | None = None) -> int:
         content = {
             "context": context, "tools": tools, "pending": pending, "feedback": feedback,
             "completed": completed or [],
         }
         if system_prompt:
             content["system_prompt"] = system_prompt
+        if budget is not None:
+            content["budget"] = budget
         return self.overhead_bytes + json_bytes(content)
 
 
@@ -114,8 +117,9 @@ def _summary_fragments(messages: list[dict], policy: ContextPolicy, budget: int)
 
 
 async def compact(view: dict, policy: ContextPolicy, tools: list, pending: list,
-                  summarize, *, budget: int, feedback: str = "", max_calls: int = 12,
-                  completed: list | None = None, system_prompt: str = "") -> dict:
+                  summarize, *, budget: int, feedback: str | dict = "", max_calls: int = 12,
+                  completed: list | None = None, system_prompt: str = "",
+                  runtime_budget: dict | None = None) -> dict:
     """Fold an old prefix in bounded chunks. Never slice content out of existence."""
     messages = view["messages"]
     if not messages:
@@ -128,14 +132,16 @@ async def compact(view: dict, policy: ContextPolicy, tools: list, pending: list,
         # documents still undergo summarization. No task-specific fields exist.
         through = max(view["through"], messages[cut-1]["id"])
         candidate = {"summary": "x" * policy.summary_bytes, "through": through, "messages": []}
-        available = budget - policy.size(candidate, tools, pending, feedback, completed, system_prompt)
+        available = budget - policy.size(candidate, tools, pending, feedback, completed, system_prompt,
+                                         budget=runtime_budget)
         retained_budget = min(budget // 4, max(0, available))
         retained = []
         for message in messages[:cut]:
             if message["source"] == "user" and json_bytes([*retained, message]) <= retained_budget:
                 retained.append(message)
         candidate["messages"] = [*retained, *messages[cut:]]
-        if policy.size(candidate, tools, pending, feedback, completed, system_prompt) <= budget:
+        if policy.size(candidate, tools, pending, feedback, completed, system_prompt,
+                       budget=runtime_budget) <= budget:
             break
         if keep == 0:
             raise ModelError("system prompt, tools or pending operations exceed context allowance",

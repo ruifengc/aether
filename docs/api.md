@@ -185,9 +185,9 @@ agent.forget(receipt.conversation_id)
 Agent(..., system_prompt="...") 配置宿主业务提示；agent.register_prompt(text) 按调用顺序追加片段，中间以两个换行分隔。默认无业务提示，不要求注册任何常用工具：
 
 ```python
-async with Agent(model, system_prompt="你是新闻证据服务，依据工具资料回答。") as agent:
-    agent.register_prompt("明确区分报道事实与推断，保留原文来源编号。")
-    receipt = await agent.submit("查询最新进展。")
+async with Agent(model, system_prompt="你是库存查询服务，依据工具结果回答。") as agent:
+    agent.register_prompt("保留商品编号、数量和单位；明确说明缺失的信息。")
+    receipt = await agent.submit("查询 SKU-A 的可用库存。")
     result = await agent.wait(receipt.run_id)
 ```
 
@@ -195,7 +195,7 @@ async with Agent(model, system_prompt="你是新闻证据服务，依据工具�
 
 提示属于 Agent 实例，适用于其所有会话；不同业务使用不同 Agent，可以共享同一个模型适配器。没有注册时快照不含 system_prompt；有注册时 snapshot.system_prompt 为完整文本，自定义模型适配器负责把它放到供应商支持的指令位置。用户消息中同名字段仍只是普通输入，不改变注册配置。
 
-默认 ChatModel 每次先发送简短的运行协议，再拼接宿主指令，两者位于同一 system 消息；业务提示不重复放进 user 快照。协议解释来源、摘要、在途操作和 await_input 控制，不预设业务角色、回答长短或新闻规则。工具描述与 schema 单独提供；摘要调用使用独立的压缩说明，不把宿主指令当摘要任务。库内默认协议、摘要说明、恢复反馈、控制工具及常用工具描述均为英文；宿主通过 system_prompt/register_prompt 提供的文本保留原样，不自动翻译。
+默认 ChatModel 每次先发送简短的运行协议，再拼接宿主指令，两者位于同一 system 消息；业务提示不重复放进 user 快照。协议解释来源、摘要、在途操作和 await_input 控制，不预设业务角色、回答长短或业务规则。工具描述与 schema 单独提供；摘要调用使用独立的压缩说明，不把宿主指令当摘要任务。库内默认协议、摘要说明、恢复反馈、控制工具及常用工具描述均为英文；宿主通过 system_prompt/register_prompt 提供的文本保留原样，不自动翻译。
 
 宿主提示按现有 UTF-8 字节估计计入输入额度，不参与会话压缩；提示本身过大时明确报告预算错误，不自动摘要或截断。默认批等待、预算限制和版本检查仍由代码执行，不靠提示词保证。
 
@@ -205,6 +205,8 @@ through 是已处理前缀的覆盖游标，不意味着所有 id<=through 的�
 
 ChatModel 使用 OpenAI 兼容协议，历史通过角色化状态快照表达，不回放原生 assistant tool_calls 或隐藏 reasoning 历史。它支持原生 function calling；await_input 是运行时等待控制，具体参数见上节，正文始终是唯一输出位置。正文可以和等待决定同时出现。完整 transcript 回放需另行遵守具体供应商协议。
 
+通过现有接口组合生成、校核与修订的配方，以及自定义消息适配的边界，见 [模型工作流](model-workflows.md)。
+
 请求将 context（旧式适配为 inputs）放在易变的 pending、completed 和 feedback 之前，尽量保留已有历史的可缓存前缀。TokenHub（provider=tencent）的决策请求以 conversation_id 设置 prompt_cache_key 和 X-Session-ID，跨 run 保持、换会话切换；中文、控制字符或过长的 ID 先转为稳定 SHA-256 值，避免非法 HTTP Header。没有会话 ID 时不添加，其他供应商不添加这两个路由字段。摘要接口没有会话 ID，不继承上次决策的标识。供应商返回的缓存用量保留在 model.completed 的原始 usage 中，query 的 usage 当前只汇总输入与输出 tokens，不汇总缓存明细。
 
 缓存命中率按总命中输入 tokens / 总输入 tokens 计算，不是各请求比例的简单平均。首次请求、工具集合变化和摘要改写前缀时可能下降；服务端缓存不保证每次命中。
@@ -213,11 +215,32 @@ Tool 接收名称、说明、JSON schema 和普通函数。同步函数在线程
 
 除构造参数 `Agent(model, tools=[...])` 外，也可使用 `agent.register_tool(tool)` 追加注册，后续决策即可看到工具；注册本身不触发模型调用，不影响已经发出的请求。名称必须非空且唯一；tools 为只读映射，增添工具须使用 register_tool；仅 ChatModel 保留 await_input 名称，冲突在请求前以 fatal ModelError 报告，自定义模型不受这个名称限制；关闭后不允许注册。参数 schema 提供给模型，目前执行前检查 Python 函数签名，未引入通用 JSON Schema 校验器；本地工具自行检查必要的参数类型与范围。
 
-## 压缩与预算
+## 运行预算
+
+query、订阅快照和 Model.decide 的 snapshot 均包含 budget。它是独立的数据副本，修改它不会改变内核限制。每个计数项包含 max、used、remaining 和 unit：
+
+| budget 项 | 上限来源 | used 的含义 | unit |
+| --- | --- | --- | --- |
+| model_calls | Limits.model_calls | 已发起的决策尝试，包含正在处理的本次请求 | attempts |
+| tool_calls | Limits.tool_calls | 已提交的业务工具调用，包含失败、超时及在途调用 | calls |
+| summary_calls | Limits.summary_calls | 已发起的摘要器调用尝试，包含失败尝试 | attempts |
+| recoveries | Limits.model_retries | 已启动的恢复次数，按整次 run 累计 | recoveries |
+
+remaining 为 max-used，最低为 0。比如默认配置下，第一次 decide 看到 `budget.model_calls={"max":10,"used":1,"remaining":9,"unit":"attempts"}`；remaining 表示本次之后还能发起的尝试数。原有顶层计数仍存在，与 budget.used 一致。
+
+默认 ChatModel 把 budget 放在 context、pending、completed 之后，feedback 之前，保留历史前缀。预算数据本身计入 ContextPolicy 的同一字节额度。自定义适配器也应传递此信息，模型能看到余额不改变内核硬限制。未配置运行级期限时没有 remaining_time；wait(timeout) 仍只影响该等待方。
+
+本次工具批次超过余额时，不发布它的正文、不执行任何一个调用，也不截取部分执行。还有工具余额、后续决策额度及恢复额度时，进入原有有界恢复；feedback 是结构化对象，含 `code="tool_call_limit"`、requested、remaining 和英文 message。模型可以缩小批次或直接回答。任一所需额度耗尽则明确失败，error 为 tool_call_limit。合法决定被接受后清空 feedback；拒绝的决定已消耗的模型次数和 usage 不回滚。
+
+## 压缩与上下文预算
 
 Agent(..., context=ContextPolicy(...), summarizer=...) 可配置压缩。默认优先使用模型的 summarize 方法；ChatModel 已提供。自定义摘要器为 async summarize(previous: str, fragment: str, max_bytes: int) -> Summary，返回文本与可选 usage。只有 decide 的简单模型仍可在预算内工作，超过预算却没有摘要器时会明确失败。
 
 fragment 是 JSON 文本：通常为完整消息数组；单条记录过大时，使用 id、source、offset、fragment 对象，fragment 字段包含该记录的序列化文本片段，offset 按 Unicode 字符计数。片段按时间及偏移顺序处理，来源和消息 ID 不丢失；不能假设不同调用的 fragment 字符串直接拼接就是一个 JSON 数组。每次请求为 previous 预留摘要额度，并计入字符串转义开销。所有分片成功后才提交一次前缀替换，后续分片失败不提交半份摘要。
+
+同次压缩中已经通过非空和 JSON 字节上限检查的块摘要暂存在当前 run。后续块失败后，只复用 previous、fragment、max_bytes 完全相同的成功结果；复用不调用摘要器、不消耗 summary_calls、不重复累计 usage，并发出 context.summary_reused 事件。空白、超长或失败结果不缓存。
+
+缓存提交经过运行队列，并校验控制操作 ID 和输入版本。消费新输入、收缩上下文预算、整体压缩提交或进入终态时清空缓存；旧版本的迟到块不能重新填入缓存。原文仍在全部分片成功后才原子替换，不跨 run 或会话复用。恢复仍受原 summary_calls 和 model_retries 上限约束。
 
 内置摘要按 Goal / Constraints / Done / Open / Facts 组织，空栏目省略；保留最新更正的适用范围、最终输出要求、完成的操作及精确结构化事实。使用紧凑英文和原始键值节省空间，仍按实际序列化字节数验收，不保证模型语义无损。
 

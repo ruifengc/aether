@@ -16,8 +16,8 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
-from .context import Context, ContextPolicy, compact
-from .contracts import Call, Decision, Event, Limits, Model, Receipt, Summarizer, Tool
+from .context import Context, ContextPolicy, compact, json_bytes
+from .contracts import Call, Decision, Event, Limits, Model, Receipt, Summarizer, Summary, Tool
 from .errors import ModelError
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -97,8 +97,9 @@ class _Run:
     model_id: str | None = None
     model_calls: int = 0
     summary_calls: int = 0
+    summary_cache: dict[tuple[str, str, int], str] = field(default_factory=dict)
     recoveries: int = 0
-    feedback: str = ""
+    feedback: str | dict = ""
     context_budget: int = 0
     phase: str | None = None
     tool_calls: int = 0
@@ -340,9 +341,20 @@ class Agent:
             "usage": {**run.usage, "known": run.usage_known},
         })
         snapshot["context"] = run.context.view()
+        snapshot["budget"] = self._budget(run)
         if self._system_prompt:
             snapshot["system_prompt"] = self._system_prompt
         return snapshot
+
+    def _budget(self, run: _Run, *, next_model_call: bool = False) -> dict:
+        counters = (
+            ("model_calls", self.limits.model_calls, run.model_calls + next_model_call, "attempts"),
+            ("tool_calls", self.limits.tool_calls, run.tool_calls, "calls"),
+            ("summary_calls", self.limits.summary_calls, run.summary_calls, "attempts"),
+            ("recoveries", self.limits.model_retries, run.recoveries, "recoveries"),
+        )
+        return {name: {"max": maximum, "used": used, "remaining": max(0, maximum - used),
+                       "unit": unit} for name, maximum, used, unit in counters}
 
     def _emit(self, run: _Run, kind: str, **data):
         event = Event(run.id, len(run.events) + 1, kind, deepcopy(data), time.time())
@@ -366,6 +378,7 @@ class Agent:
                     self._emit(run, "message.ignored", reason="terminal", message_type=kind)
                     continue
                 if kind == "input":
+                    run.summary_cache.clear()
                     run.inputs.append(payload)
                     run.context.append(payload["source"], payload["content"], run_id=run.id,
                                        input_seq=payload["seq"], **{k: v for k, v in payload.items()
@@ -391,6 +404,7 @@ class Agent:
                         run.model_id = None
                         run.phase = None
                         run.context.apply(update)
+                        run.summary_cache.clear()
                         run.dirty = True
                         self._emit(run, "context.compacted", through=update["through"],
                                    retained=len(run.context.messages))
@@ -399,6 +413,12 @@ class Agent:
                     self._emit(run, "context.summary_started", call=run.summary_calls)
                 elif kind == "summary_usage":
                     self._usage(run, payload)
+                elif kind == "summary_cached":
+                    operation_id, version, key, content = payload
+                    if operation_id == run.model_id and version == run.accepted:
+                        run.summary_cache[key] = content
+                elif kind == "summary_reused":
+                    self._emit(run, "context.summary_reused")
                 elif kind == "retry":
                     if payload == run.model_id:
                         run.model_id = None
@@ -428,10 +448,13 @@ class Agent:
         run.model_id = operation_id
         version = run.accepted
         view = self._snapshot(run)
+        # Reserve the prospective decision in its input estimate. Compaction
+        # itself does not consume a decision attempt.
+        view["budget"] = self._budget(run, next_model_call=True)
         schemas = [t.schema() for t in self._tools.values()]
         if self.context_policy.size(view["context"], schemas, view["pending"],
                                     run.feedback, view["completed"],
-                                    self._system_prompt) > run.context_budget:
+                                    self._system_prompt, budget=view["budget"]) > run.context_budget:
             run.phase = "compacting"
             self._emit(run, "context.compacting", through=run.context.through,
                        input_version=version)
@@ -439,6 +462,7 @@ class Agent:
             self._spawn(run, operation_id, self._compact(run, operation_id, view, schemas))
             return
         run.model_calls += 1
+        view["model_calls"] = run.model_calls
         run.phase = "deciding"
         self._emit(run, "model.started", operation_id=operation_id, input_version=version)
         run.state = "waiting"
@@ -468,11 +492,28 @@ class Agent:
         run.inbox.put_nowait(("model", (operation_id, version, result)))
 
     async def _compact(self, run: _Run, operation_id: str, view: dict, schemas: list):
+        cached = run.summary_cache.copy()
+        remaining = self.limits.summary_calls - run.summary_calls
+        calls = 0
+
         async def summarize(previous, fragment, max_bytes):
+            nonlocal calls
+            key = (previous, fragment, max_bytes)
+            if key in cached:
+                run.inbox.put_nowait(("summary_reused", None))
+                return Summary(cached[key])
+            if calls >= remaining:
+                raise ModelError("summary_call_limit", kind="fatal")
+            calls += 1
             run.inbox.put_nowait(("summary_started", None))
             async with asyncio.timeout(self.limits.model_timeout):
                 result = await self.summarizer(previous, fragment, max_bytes)
             run.inbox.put_nowait(("summary_usage", result.usage))
+            # Keep only accepted pieces. A later failure must not spend the
+            # remaining request budget redoing the same successful prefix.
+            if result.content.strip() and json_bytes(result.content) <= max_bytes:
+                run.inbox.put_nowait(("summary_cached", (
+                    operation_id, view["input_version"], key, result.content)))
             return result
 
         try:
@@ -480,8 +521,9 @@ class Agent:
                 raise ModelError("context limit reached; model needs a summarizer")
             update = await compact(view["context"], self.context_policy, schemas, view["pending"],
                                    summarize, budget=run.context_budget, feedback=run.feedback,
-                                   max_calls=self.limits.summary_calls - run.summary_calls,
-                                   completed=view["completed"], system_prompt=self._system_prompt)
+                                   max_calls=self.limits.summary_calls,
+                                   completed=view["completed"], system_prompt=self._system_prompt,
+                                   runtime_budget=view["budget"])
         except asyncio.CancelledError:
             return
         except TimeoutError:
@@ -505,7 +547,7 @@ class Agent:
             else:
                 run.usage_known = False
 
-    def _recover(self, run: _Run, error: ModelError):
+    def _recover(self, run: _Run, error: ModelError, *, feedback: dict | None = None):
         if error.usage is not None:
             self._usage(run, error.usage)
         if error.kind not in {"transient", "context", "invalid_response", "length"}:
@@ -516,6 +558,7 @@ class Agent:
             return
         run.recoveries += 1
         if error.kind == "context":
+            run.summary_cache.clear()
             minimum = (self.context_policy.overhead_bytes +
                        2 * self.context_policy.summary_bytes + 513)
             budget = max(minimum, int(run.context_budget * .65))
@@ -524,9 +567,10 @@ class Agent:
                 return
             run.context_budget = budget
         if error.kind in {"invalid_response", "length"}:
-            run.feedback = ("The previous request did not produce a complete executable response. "
-                            "Correct the format and tool arguments; call only registered tools. "
-                            "For a direct reply, provide a complete, concise answer.")
+            run.feedback = feedback if feedback is not None else (
+                "The previous request did not produce a complete executable response. "
+                "Correct the format and tool arguments; call only registered tools. "
+                "For a direct reply, provide a complete, concise answer.")
         delay = min(30, max(error.retry_after,
                            self.limits.retry_delay * 2 ** (run.recoveries - 1)))
         run.model_id = uuid4().hex
@@ -581,8 +625,19 @@ class Agent:
             self._recover(run, ModelError("invalid_wait_for", kind="invalid_response"))
             return
         if result.calls and run.tool_calls + len(result.calls) > self.limits.tool_calls:
-            self._finish(run, "failed", error="tool_call_limit")
+            remaining = self.limits.tool_calls - run.tool_calls
+            if (remaining <= 0 or run.model_calls >= self.limits.model_calls
+                    or run.recoveries >= self.limits.model_retries):
+                self._finish(run, "failed", error="tool_call_limit")
+            else:
+                self._recover(run, ModelError("tool_call_limit", kind="invalid_response"), feedback={
+                    "code": "tool_call_limit", "requested": len(result.calls),
+                    "remaining": remaining,
+                    "message": "No calls in this batch were executed. Reduce the batch to fit "
+                               "the remaining tool budget, or give a complete answer without tools.",
+                })
             return
+        run.feedback = ""
         if result.content:
             run.output = result.content
             run.context.append("assistant", result.content, run_id=run.id)
@@ -658,5 +713,6 @@ class Agent:
         for task in run.effects.values():
             task.cancel()
         run.operations.clear()
+        run.summary_cache.clear()
         run.waiting_for.clear()
         run.finished.set()

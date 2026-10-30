@@ -108,7 +108,9 @@ bash scripts/check.sh
 uv build
 ```
 
-检查包含工作区和实际 index 的凭据扫描、Ruff、105 项机制与工具测试，以及固定脚本协作示例，不需要 CLI 或原实验工作区。初次安装依赖可能需要联网，检查本身不调用模型。源码发行包包含两份 README、文档、示例、测试与检查脚本。
+检查包含工作区和实际 index 的凭据扫描、Ruff、机制与工具测试，以及固定脚本协作和校核示例，不需要 CLI 或原实验工作区。初次安装依赖可能需要联网，检查本身不调用模型。源码发行包包含两份 README、文档、示例、测试与检查脚本。
+
+运行快照提供决策、工具、摘要和恢复的最大、已用及剩余额度，默认适配器会传给模型；超额工具批次可在同一有界恢复额度内纠正。摘要恢复复用成功块，新输入或压缩完成后清理。[校核与修订示例](examples/reviewed_research.py) 在一个 run 内共享预算，不调用真实模型；组合方式与适配边界见 [模型工作流](docs/model-workflows.md)。
 
 上下文预算使用 `ContextPolicy(input_bytes=24000, summary_bytes=1200, overhead_bytes=2048)`，按 UTF-8 字节保守估计；模型输出限制 `max_tokens`/`max_output_tokens` 和实际 `usage` 仍以 tokens 计数。
 
