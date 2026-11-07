@@ -24,6 +24,8 @@ uv sync --extra live --no-dev
 import asyncio
 import os
 
+import httpx
+
 from aether import Agent
 from aether.chat import ChatModel, Settings
 
@@ -36,7 +38,9 @@ async def main():
         provider="openai-compatible",
         reasoning=None,  # 供应商支持时再设置推理级别。
     )
-    async with Agent(ChatModel(settings), system_prompt="Keep exact IDs.") as agent:
+    async with httpx.AsyncClient() as client, Agent(
+        ChatModel(settings, client=client), system_prompt="Keep exact IDs."
+    ) as agent:
         agent.register_prompt("Answer concisely.")
         first = await agent.submit("Remember the fictional project ID ORBIT-17.")
         await agent.wait(first.run_id)
@@ -115,3 +119,7 @@ uv build
 上下文预算使用 `ContextPolicy(input_bytes=24000, summary_bytes=1200, overhead_bytes=2048)`，按 UTF-8 字节保守估计；模型输出限制 `max_tokens`/`max_output_tokens` 和实际 `usage` 仍以 tokens 计数。
 
 当前为单进程、内存运行库。摘要有损，取消不能撤销外部动作；跨进程交付与重启恢复留待具体需求驱动。
+
+`ChatModel(..., client=client)` 可借用宿主管理的 `httpx.AsyncClient`，在决策与摘要之间复用连接；先关闭 Agent，再关闭 client。不传 client 时仍逐请求管理连接。`Settings(thinking=False)` 在支持该字段的后端明确关闭思考；`reasoning=None` 只是省略强度参数，仍采用供应商默认值。
+
+运行快照汇总供应商已报告的整数用量明细，`usage_reports` 标明覆盖次数；未报告不能当作零。`model.completed.elapsed_s` 是整次决定耗时，不是首 token 延迟。真实后端对照命令与限制见[后端检查](docs/backend-checks.md)。

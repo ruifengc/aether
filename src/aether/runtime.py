@@ -96,6 +96,7 @@ class _Run:
     effects: dict[str, asyncio.Task] = field(default_factory=dict)
     model_id: str | None = None
     model_calls: int = 0
+    model_started_at: float = 0
     summary_calls: int = 0
     summary_cache: dict[tuple[str, str, int], str] = field(default_factory=dict)
     recoveries: int = 0
@@ -106,6 +107,8 @@ class _Run:
     discarded: int = 0
     usage: dict = field(default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0})
     usage_known: bool = True
+    usage_calls: int = 0
+    usage_reported: dict = field(default_factory=dict)
     output: str | None = None
     error: str | None = None
     dirty: bool = False
@@ -339,6 +342,7 @@ class Agent:
             "phase": run.phase, "feedback": run.feedback,
             "discarded_decisions": run.discarded,
             "usage": {**run.usage, "known": run.usage_known},
+            "usage_reports": {"calls": run.usage_calls, "fields": run.usage_reported},
         })
         snapshot["context"] = run.context.view()
         snapshot["budget"] = self._budget(run)
@@ -462,6 +466,7 @@ class Agent:
             self._spawn(run, operation_id, self._compact(run, operation_id, view, schemas))
             return
         run.model_calls += 1
+        run.model_started_at = time.monotonic()
         view["model_calls"] = run.model_calls
         run.phase = "deciding"
         self._emit(run, "model.started", operation_id=operation_id, input_version=version)
@@ -540,12 +545,24 @@ class Agent:
             run.inbox.put_nowait(("model", (operation_id, view["input_version"], error)))
 
     def _usage(self, run: _Run, usage: dict):
-        for key in run.usage:
-            value = usage.get(key)
-            if type(value) is int:
-                run.usage[key] += value
-            else:
+        run.usage_calls += 1
+        for key in ("prompt_tokens", "completion_tokens"):
+            if type(usage.get(key)) is not int or usage[key] < 0:
                 run.usage_known = False
+
+        def accumulate(target, values, prefix=""):
+            for key, value in values.items():
+                path = prefix + key
+                if key == "known":
+                    continue
+                if type(value) is int and value >= 0:
+                    if isinstance(target.get(key, 0), int):
+                        target[key] = target.get(key, 0) + value
+                        run.usage_reported[path] = run.usage_reported.get(path, 0) + 1
+                elif isinstance(value, dict) and isinstance(target.get(key, {}), dict):
+                    accumulate(target.setdefault(key, {}), value, path + ".")
+
+        accumulate(run.usage, usage)
 
     def _recover(self, run: _Run, error: ModelError, *, feedback: dict | None = None):
         if error.usage is not None:
@@ -601,7 +618,8 @@ class Agent:
             return
         self._usage(run, result.usage)
         self._emit(run, "model.completed", input_version=version,
-                   finish_reason=result.finish_reason, usage=result.usage)
+                   finish_reason=result.finish_reason, usage=result.usage,
+                   elapsed_s=time.monotonic() - run.model_started_at)
         if self.freshness_guard and version != run.accepted:
             run.discarded += 1
             run.dirty = True

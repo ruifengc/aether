@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import os
+from contextlib import AsyncExitStack
 
 from aether import Agent, Call, Decision, Tool
 from aether.chat import ChatModel, Settings
@@ -35,7 +36,7 @@ class ScriptedAssistant:
 
 
 async def main(live=False):
-    async with Agent(Inventory()) as service:
+    async with AsyncExitStack() as stack, Agent(Inventory()) as service:
         async def inventory(sku):
             receipt = await service.submit({"sku": sku})
             result = await service.wait(receipt.run_id)
@@ -45,10 +46,15 @@ async def main(live=False):
 
         tools = [Tool("inventory", "查询 SKU 库存", {"type": "object", "properties": {
             "sku": {"type": "string"}}, "required": ["sku"]}, inventory)]
+        client = None
+        if live:
+            import httpx
+
+            client = await stack.enter_async_context(httpx.AsyncClient())
         model = ChatModel(Settings(
             api_key=os.environ["TOKENHUB_API_KEY"],
             base_url=os.environ.get("TOKENHUB_BASE_URL", "https://tokenhub.tencentmaas.com/v1"),
-            model="deepseek/deepseek-flash", provider="tencent")) if live else ScriptedAssistant()
+            model="deepseek/deepseek-flash", provider="tencent"), client=client) if live else ScriptedAssistant()
         async with Agent(model, tools) as assistant:
             receipt = await assistant.submit("查询 SKU-A 库存，严格只回答数量。")
             result = await assistant.wait(receipt.run_id)

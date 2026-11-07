@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -72,6 +73,11 @@ class Settings:
     model: str
     provider: str
     reasoning: str | None = "high"
+    thinking: bool | None = None
+
+    def __post_init__(self):
+        if self.thinking is not None and type(self.thinking) is not bool:
+            raise ValueError("thinking must be True, False or None")
 
 
 class ChatModel:
@@ -83,7 +89,7 @@ class ChatModel:
 
     def __init__(self, settings: Settings, *, max_tokens: int = 1536,
                  timeout: float = 110, record_path: Path | None = None, transport=None,
-                 max_output_tokens: int = 8192):
+                 max_output_tokens: int = 8192, client=None):
         if max_tokens < 1 or max_output_tokens < max_tokens or timeout <= 0:
             raise ValueError("invalid model output budget or timeout")
         self.settings = settings
@@ -92,6 +98,10 @@ class ChatModel:
         self.record_path = record_path
         self._transport = transport
         self.max_output_tokens = max_output_tokens
+        if client is not None and transport is not None:
+            raise ValueError("supply client or transport, not both")
+        # The host owns the optional client, including connection pooling and closing.
+        self._client = client
 
     async def decide(self, snapshot: dict, tools: list[dict]) -> Decision:
         if any(tool["function"]["name"] == "await_input" for tool in tools):
@@ -198,17 +208,23 @@ class ChatModel:
     async def _request(self, payload: dict) -> dict:
         import httpx
 
-        if self.settings.reasoning:
+        if self.settings.thinking is not None:
+            payload["thinking"] = {"type": "enabled" if self.settings.thinking else "disabled"}
+        if self.settings.reasoning and self.settings.thinking is not False:
             payload["reasoning_effort"] = self.settings.reasoning
         started = time.monotonic()
         headers = {"Authorization": f"Bearer {self.settings.api_key}"}
         if self.settings.provider == "tencent" and payload.get("prompt_cache_key"):
             headers["X-Session-ID"] = payload["prompt_cache_key"]
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
+            async with AsyncExitStack() as stack:
+                client = self._client
+                if client is None:
+                    client = await stack.enter_async_context(
+                        httpx.AsyncClient(timeout=self.timeout, transport=self._transport))
                 response = await client.post(
                     f"{self.settings.base_url.rstrip('/')}/chat/completions", json=payload,
-                    headers=headers,
+                    headers=headers, timeout=self.timeout,
                 )
             # Do not expose URLs, credentials, request headers, or gateway error bodies.
             if response.is_error:

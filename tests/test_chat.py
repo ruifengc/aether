@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -15,6 +16,55 @@ from aether.errors import ModelError
 class ChatTests(unittest.IsolatedAsyncioTestCase):
     def settings(self):
         return Settings("test-credential", "https://model.invalid/v1", "test-model", "test", "low")
+
+    async def test_host_client_is_reused_for_decisions_and_summary_and_not_closed(self):
+        requests = []
+
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                                                        "message": {"content": "done"}}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            model = ChatModel(self.settings(), client=client, timeout=7)
+            # Creating a per-request client would bypass the host's pool and transport.
+            with patch("httpx.AsyncClient", side_effect=AssertionError("unexpected client")):
+                await model.decide({"inputs": [], "pending": []}, [])
+                await model.decide({"inputs": [], "pending": []}, [])
+                await model.summarize("", "fragment", 500)
+            self.assertFalse(client.is_closed)
+            self.assertEqual(len(requests), 3)
+            self.assertTrue(all(r.extensions["timeout"]["read"] == 7 for r in requests))
+        self.assertTrue(client.is_closed)
+
+    async def test_explicit_thinking_switch_controls_decisions_and_summary(self):
+        for thinking in (None, True, False):
+            requests = []
+
+            def handle(request, requests=requests):
+                requests.append(json.loads(request.content))
+                return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                                                            "message": {"content": "done"}}]})
+
+            model = ChatModel(Settings("test", "https://model.invalid", "test", "deepseek",
+                                       "high", thinking), transport=httpx.MockTransport(handle))
+            await model.decide({"inputs": [], "pending": []}, [])
+            await model.summarize("", "fragment", 500)
+            for request in requests:
+                if thinking is None:
+                    self.assertNotIn("thinking", request)
+                else:
+                    self.assertEqual(request["thinking"]["type"],
+                                     "enabled" if thinking else "disabled")
+                self.assertEqual(request.get("reasoning_effort"),
+                                 None if thinking is False else "high")
+
+    def test_client_ownership_and_thinking_configuration_are_unambiguous(self):
+        with self.assertRaisesRegex(ValueError, "client or transport"):
+            ChatModel(self.settings(), client=object(), transport=object())
+        for value in (0, 1, "disabled"):
+            with self.assertRaisesRegex(ValueError, "thinking"):
+                Settings("test", "https://model.invalid", "test", "deepseek", thinking=value)
 
     async def test_transport_timeout_is_classified_without_url_or_private_detail(self):
         def handle(request):

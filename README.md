@@ -26,6 +26,8 @@ Save this as `chat.py`, configure those variables for your provider, and run `uv
 import asyncio
 import os
 
+import httpx
+
 from aether import Agent
 from aether.chat import ChatModel, Settings
 
@@ -38,7 +40,9 @@ async def main():
         provider="openai-compatible",
         reasoning=None,  # Set a reasoning level if your provider supports one.
     )
-    async with Agent(ChatModel(settings), system_prompt="Keep exact IDs.") as agent:
+    async with httpx.AsyncClient() as client, Agent(
+        ChatModel(settings, client=client), system_prompt="Keep exact IDs."
+    ) as agent:
         agent.register_prompt("Answer concisely.")
         first = await agent.submit("Remember the fictional project ID ORBIT-17.")
         await agent.wait(first.run_id)
@@ -115,3 +119,7 @@ Checks cover worktree and index credential scans, Ruff, runtime and tool tests, 
 Context budgets use `ContextPolicy(input_bytes=24000, summary_bytes=1200, overhead_bytes=2048)`: conservative UTF-8 byte counts. Model output limits (`max_tokens`/`max_output_tokens`) and actual `usage` remain token counts.
 
 Aether currently runs in one process with in-memory state. Summaries are lossy, and cancellation cannot undo external effects. Cross-process delivery and restart recovery remain future, demand-driven work.
+
+The optional `ChatModel(..., client=client)` borrows a host-owned `httpx.AsyncClient` to reuse connections across decisions and summaries; close the Agent before the client. Without a supplied client, requests remain self-contained. `Settings(thinking=False)` explicitly disables thinking on backends supporting that field; `reasoning=None` only omits the effort parameter. Provider defaults still apply.
+
+Run snapshots retain reported integer usage details (including nested cache/reasoning counters) and `usage_reports` describes coverage; absent fields are not measured zeroes. `model.completed` includes whole-decision `elapsed_s`, not TTFT. See [backend checks](docs/backend-checks.md) for the opt-in live comparison and its limits.

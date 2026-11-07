@@ -207,7 +207,7 @@ ChatModel 使用 OpenAI 兼容协议，历史通过角色化状态快照表达�
 
 通过现有接口组合生成、校核与修订的配方，以及自定义消息适配的边界，见 [模型工作流](model-workflows.md)。
 
-请求将 context（旧式适配为 inputs）放在易变的 pending、completed 和 feedback 之前，尽量保留已有历史的可缓存前缀。TokenHub（provider=tencent）的决策请求以 conversation_id 设置 prompt_cache_key 和 X-Session-ID，跨 run 保持、换会话切换；中文、控制字符或过长的 ID 先转为稳定 SHA-256 值，避免非法 HTTP Header。没有会话 ID 时不添加，其他供应商不添加这两个路由字段。摘要接口没有会话 ID，不继承上次决策的标识。供应商返回的缓存用量保留在 model.completed 的原始 usage 中，query 的 usage 当前只汇总输入与输出 tokens，不汇总缓存明细。
+请求将 context（旧式适配为 inputs）放在易变的 pending、completed 和 feedback 之前，尽量保留已有历史的可缓存前缀。TokenHub（provider=tencent）的决策请求以 conversation_id 设置 prompt_cache_key 和 X-Session-ID，跨 run 保持、换会话切换；中文、控制字符或过长的 ID 先转为稳定 SHA-256 值，避免非法 HTTP Header。没有会话 ID 时不添加，其他供应商不添加这两个路由字段。摘要接口没有会话 ID，不继承上次决策的标识。供应商返回的原始 usage 保留在 model.completed 中，query 的 usage 递归汇总非负整数明细，包括 prompt_cache_hit_tokens、prompt_cache_miss_tokens、prompt_tokens_details.cached_tokens 和 completion_tokens_details.reasoning_tokens；同义字段分别保留，不能相加。未知字段不补零，不推算缓存未命中数。usage.known 仅说明基础输入、输出计数是否完整。usage_reports.calls 是参与计量的请求/错误回报次数，usage_reports.fields 按点分字段路径记录有效报告次数；字段次数少于 calls 时，其合计只是已报告部分。摘要、已丢弃决定和截断重试同样消耗用量；本地复用摘要不增加供应商调用。model.completed.elapsed_s 是决定从发起到结果消费的单调时钟耗时，包含调度等待，不是 TTFT。
 
 缓存命中率按总命中输入 tokens / 总输入 tokens 计算，不是各请求比例的简单平均。首次请求、工具集合变化和摘要改写前缀时可能下降；服务端缓存不保证每次命中。
 
@@ -303,3 +303,9 @@ ChatModel 接收显式 Settings(api_key, base_url, model, provider, reasoning="h
 历史、原始输入、事件和去重表都在内存里，由 prune 和 forget 显式释放，尚无自动过期、持久化、跨进程交付或重启恢复。摘要有损；取消不能撤销已发生的外部动作，也无法强制停止正在执行的同步线程。
 
 公开类型可从 aether 导入；跨模块契约位于 aether.contracts，包括 Model、Summarizer、Call、Decision、Tool、Limits、Receipt、Event 和 Summary。Subscription 与 Agent 属于运行实现，通过包入口导出。Model 使用结构化协议，不要求继承基类。
+
+## HTTP 客户端与思考控制
+
+ChatModel(..., client=client) 借用宿主传入的 httpx.AsyncClient，决策和摘要共用连接池；适配器不关闭该 client。宿主应先关闭所有使用它的 Agent，再关闭 client。不能同时传入 client 和测试用 transport；每次请求仍应用 ChatModel.timeout。未传 client 时保持逐请求创建与关闭的行为。
+
+Settings.thinking 默认为 None，不发送开关；True/False 分别发送 thinking.type=enabled/disabled。明确关闭时省略 reasoning_effort，避免冲突。reasoning=None 只省略强度参数，不代表关闭思考。上述扩展由宿主按具体供应商能力选择，不能假定所有兼容端点都支持。
