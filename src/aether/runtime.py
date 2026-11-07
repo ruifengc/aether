@@ -1,12 +1,12 @@
-"""One mailbox per run; only slow effects run outside the mailbox.
+"""Process queued messages and returned results in order.
 
-No broker, persistence, approval layer, or model-vendor dependency. Models consume
-state snapshots, so they can decide while tools are still running.
+Model requests, tools and summarization run outside the state update queue.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from collections.abc import Mapping
@@ -17,7 +17,18 @@ from typing import Any
 from uuid import uuid4
 
 from .context import Context, ContextPolicy, compact, json_bytes
-from .contracts import Call, Decision, Event, Limits, Model, Receipt, Summarizer, Summary, Tool
+from .contracts import (
+    Call,
+    Decision,
+    Event,
+    Limits,
+    Model,
+    Receipt,
+    Summarizer,
+    Summary,
+    Tool,
+    ToolDefinition,
+)
 from .errors import ModelError
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -96,6 +107,7 @@ class _Run:
     effects: dict[str, asyncio.Task] = field(default_factory=dict)
     model_id: str | None = None
     model_calls: int = 0
+    model_started_at: float = 0
     summary_calls: int = 0
     summary_cache: dict[tuple[str, str, int], str] = field(default_factory=dict)
     recoveries: int = 0
@@ -106,6 +118,8 @@ class _Run:
     discarded: int = 0
     usage: dict = field(default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0})
     usage_known: bool = True
+    usage_calls: int = 0
+    usage_reported: dict = field(default_factory=dict)
     output: str | None = None
     error: str | None = None
     dirty: bool = False
@@ -115,7 +129,7 @@ class _Run:
 
 class Agent:
     def __init__(self, model: Model, tools: tuple[Tool, ...] | list[Tool] = (), *,
-                 limits: Limits | None = None, freshness_guard: bool = True,
+                 limits: Limits | None = None,
                  context: ContextPolicy | None = None, summarizer: Summarizer | None = None, system_prompt: str = ""):
         self.model = model
         self._closed = False
@@ -131,8 +145,6 @@ class Agent:
         self.limits = limits or Limits()
         self.context_policy = context or ContextPolicy()
         self.summarizer = summarizer or getattr(model, "summarize", None)
-        # Exposed only to test the ablation; normal callers should retain the guard.
-        self.freshness_guard = freshness_guard
         self._runs: dict[str, _Run] = {}
         self._conversations: dict[str, _Conversation] = {}
         self._receipts: dict[str, tuple[Any, Receipt]] = {}
@@ -143,7 +155,7 @@ class Agent:
         return MappingProxyType(self._tools)
 
     def register_prompt(self, prompt: str) -> None:
-        """Append host instructions before the first successful submission."""
+        """Append application instructions before the first successful submission."""
         if self._closed:
             raise RuntimeError("agent is closed")
         if self._prompts_frozen:
@@ -315,8 +327,13 @@ class Agent:
             for task in run.effects.values():
                 task.cancel()
                 tasks.append(task)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            close_model = getattr(self.model, "aclose", None)
+            if close_model is not None:
+                await close_model()
 
     @staticmethod
     def _check_cursor(run: _Run, cursor: int):
@@ -339,6 +356,7 @@ class Agent:
             "phase": run.phase, "feedback": run.feedback,
             "discarded_decisions": run.discarded,
             "usage": {**run.usage, "known": run.usage_known},
+            "usage_reports": {"calls": run.usage_calls, "fields": run.usage_reported},
         })
         snapshot["context"] = run.context.view()
         snapshot["budget"] = self._budget(run)
@@ -434,6 +452,10 @@ class Agent:
         except Exception as exc:
             self._finish(run, "failed", error=f"runtime:{type(exc).__name__}:{exc}")
 
+    def _tool_definitions(self) -> list[ToolDefinition]:
+        return [{"name": tool.name, "description": tool.description,
+                 "parameters": deepcopy(tool.parameters)} for tool in self._tools.values()]
+
     def _drive(self, run: _Run):
         if (run.state in TERMINAL or run.cancel_requested or run.model_id or run.waiting_for
                 or not run.dirty
@@ -451,7 +473,7 @@ class Agent:
         # Reserve the prospective decision in its input estimate. Compaction
         # itself does not consume a decision attempt.
         view["budget"] = self._budget(run, next_model_call=True)
-        schemas = [t.schema() for t in self._tools.values()]
+        schemas = self._tool_definitions()
         if self.context_policy.size(view["context"], schemas, view["pending"],
                                     run.feedback, view["completed"],
                                     self._system_prompt, budget=view["budget"]) > run.context_budget:
@@ -462,6 +484,7 @@ class Agent:
             self._spawn(run, operation_id, self._compact(run, operation_id, view, schemas))
             return
         run.model_calls += 1
+        run.model_started_at = time.monotonic()
         view["model_calls"] = run.model_calls
         run.phase = "deciding"
         self._emit(run, "model.started", operation_id=operation_id, input_version=version)
@@ -476,7 +499,7 @@ class Agent:
     async def _decide(self, run: _Run, operation_id: str, version: int, view: dict):
         try:
             async with asyncio.timeout(self.limits.model_timeout):
-                decision = await self.model.decide(view, [t.schema() for t in self._tools.values()])
+                decision = await self.model.decide(view, self._tool_definitions())
             result = decision
         except asyncio.CancelledError:
             return
@@ -540,12 +563,24 @@ class Agent:
             run.inbox.put_nowait(("model", (operation_id, view["input_version"], error)))
 
     def _usage(self, run: _Run, usage: dict):
-        for key in run.usage:
-            value = usage.get(key)
-            if type(value) is int:
-                run.usage[key] += value
-            else:
+        run.usage_calls += 1
+        for key in ("prompt_tokens", "completion_tokens"):
+            if type(usage.get(key)) is not int or usage[key] < 0:
                 run.usage_known = False
+
+        def accumulate(target, values, prefix=""):
+            for key, value in values.items():
+                path = prefix + key
+                if key == "known":
+                    continue
+                if type(value) is int and value >= 0:
+                    if isinstance(target.get(key, 0), int):
+                        target[key] = target.get(key, 0) + value
+                        run.usage_reported[path] = run.usage_reported.get(path, 0) + 1
+                elif isinstance(value, dict) and isinstance(target.get(key, {}), dict):
+                    accumulate(target.setdefault(key, {}), value, path + ".")
+
+        accumulate(run.usage, usage)
 
     def _recover(self, run: _Run, error: ModelError, *, feedback: dict | None = None):
         if error.usage is not None:
@@ -601,8 +636,9 @@ class Agent:
             return
         self._usage(run, result.usage)
         self._emit(run, "model.completed", input_version=version,
-                   finish_reason=result.finish_reason, usage=result.usage)
-        if self.freshness_guard and version != run.accepted:
+                   finish_reason=result.finish_reason, usage=result.usage,
+                   elapsed_s=time.monotonic() - run.model_started_at)
+        if version != run.accepted:
             run.discarded += 1
             run.dirty = True
             self._emit(run, "decision.discarded", input_version=version,
@@ -675,7 +711,13 @@ class Agent:
                     raise ValueError(f"unknown tool: {call.name}")
                 if not isinstance(call.arguments, dict):
                     raise ValueError("tool arguments must be an object")
-                result = await tool.execute(call.arguments)
+                inspect.signature(tool.handler).bind(**call.arguments)
+                if inspect.iscoroutinefunction(tool.handler):
+                    result = await tool.handler(**call.arguments)
+                else:
+                    result = await asyncio.to_thread(tool.handler, **call.arguments)
+                    if inspect.isawaitable(result):
+                        result = await result
                 serialized = json.dumps(result, ensure_ascii=False, allow_nan=False)
                 if len(serialized) > self.limits.tool_result_chars:
                     raise ValueError("tool result exceeds character limit; narrow the request")

@@ -1,13 +1,18 @@
 # Aether
 
-先读 README.md，再按范围阅读 docs/。目标是简洁、优雅、职责清楚，新增抽象须有具体场景支持。
+Read README.md and the relevant documents under docs/ before changing code. Keep the design small, explicit and easy to follow.
 
-- Python 依赖与执行使用 uv，在 feature 分支开发。
-- 运行 bash scripts/check.sh；提交前检查实际 index，不只检查工作区。
-- 凭据仅运行时读取，不写入源码、提交、远端地址或公开日志。
-- 用户工具直接注册使用，不增加安全审批层。
-- 修改接口同步文档，不保留无实际需求的兼容转发模块。
-- 先通过功能分支和审查请求评审，不直接推送 master。
-- 四类基础操作是异步提交、内部流转、查询、注册通知；wait 是便利方法。
-- 库不读取宿主配置，不自动注册工具；运行机制不依赖 CLI。
-- 模型与工具慢操作在队列外执行，状态提交保持串行。
+- Use uv for Python dependencies and execution. Work on a feature branch.
+- Push changes to Gitea for review. Publish or synchronize GitHub only after review approval; do not open GitHub PRs as the review path.
+- Run bash scripts/check.sh and uv build. Before committing, inspect and scan the actual Git index.
+- Credentials are supplied at runtime. Never put them in source, commits, remote URLs or logs.
+- Keep public data and interfaces in contracts.py; execution in runtime.py; provider protocols and connections in adapters/.
+- Accept new messages while work is running. Keep state changes ordered, with model and tool calls outside the run queue.
+- Never allow an old model decision to publish output or start tools after newer input is accepted.
+- Agent manages model shutdown. Applications configure models and tools, but do not manage HTTP clients.
+- Tools are enabled by registration. Do not introduce an approval mechanism.
+- Keep the kernel independent of CLI, local configuration discovery and provider SDKs.
+- Update English and Chinese documentation together. Use ordinary words and actual API names.
+- Keep examples useful with real models. Put deterministic scheduling fixtures in tests; keep development reports and probes outside user documentation.
+- Keep tests for observable behavior and important failures. Remove duplicate checks and experiment-only switches.
+- Change interfaces and their users together. Do not retain forwarding modules without an actual compatibility requirement.

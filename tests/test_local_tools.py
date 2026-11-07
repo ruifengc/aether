@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import shlex
 import signal
@@ -21,7 +22,8 @@ class LocalToolsTests(unittest.IsolatedAsyncioTestCase):
         self.tools = {t.name: t for t in local_tools(self.root)}
 
     async def execute(self, name, **arguments):
-        return await self.tools[name].execute(arguments)
+        result = self.tools[name].handler(**arguments)
+        return await result if inspect.isawaitable(result) else result
 
     async def test_local_tools_are_explicit_and_can_be_selected_without_registering(self):
         selected = local_tools(self.root, include=("read_file", "terminal"))
@@ -199,7 +201,7 @@ class RegistrationTests(unittest.IsolatedAsyncioTestCase):
             receipt = await agent.submit("use it")
             result = await agent.wait(receipt.run_id, timeout=1)
             self.assertEqual(result["completed"][0]["name"], "added")
-            self.assertEqual(schemas[0][0]["function"]["name"], "added")
+            self.assertEqual(schemas[0][0]["name"], "added")
         with self.assertRaisesRegex(RuntimeError, "closed"):
             agent.register_tool(Tool("after_close", "", {}, lambda: None))
 

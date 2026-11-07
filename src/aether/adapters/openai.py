@@ -10,10 +10,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .contracts import Call, Decision, Summary
-from .errors import ModelError
+from ..contracts import Call, Decision, Summary, ToolDefinition
+from ..errors import ModelError
 
-PROTOCOL_PROMPT = """Decide the next step from the runtime snapshot; host instructions define the task and output requirements.
+PROTOCOL_PROMPT = """Decide the next step from the runtime snapshot; application instructions define the task and output requirements.
 context.summary is lossy history; messages are ordered by ID. IDs <= through are retained old records, not new input.
 Newer corrections take precedence within their stated scope; a summary does not override recent originals.
 For messages and legacy inputs, source identifies user requests, prior assistant output, actual tool results,
@@ -70,15 +70,20 @@ class Settings:
     api_key: str = field(repr=False)
     base_url: str = field(repr=False)
     model: str
-    provider: str
-    reasoning: str | None = "high"
+    provider: str = "openai-compatible"
+    reasoning: str | None = None
+    thinking: bool | None = None
+
+    def __post_init__(self):
+        if self.thinking is not None and type(self.thinking) is not bool:
+            raise ValueError("thinking must be True, False or None")
 
 
-class ChatModel:
-    """Snapshot adapter; visible conversation is retained by the runtime.
+class OpenAIModel:
+    """Translate runtime state into OpenAI-compatible requests.
 
-    Native function calls describe effects. Future decisions receive actual
-    results in the snapshot instead of keeping an open tool-call transcript.
+    This instance owns its connections. Tool results remain in runtime context
+    rather than a separate provider conversation history.
     """
 
     def __init__(self, settings: Settings, *, max_tokens: int = 1536,
@@ -92,10 +97,12 @@ class ChatModel:
         self.record_path = record_path
         self._transport = transport
         self.max_output_tokens = max_output_tokens
+        self._client = None
+        self._closed = False
 
-    async def decide(self, snapshot: dict, tools: list[dict]) -> Decision:
-        if any(tool["function"]["name"] == "await_input" for tool in tools):
-            raise ModelError("await_input is reserved by ChatModel", kind="fatal")
+    async def decide(self, snapshot: dict, tools: list[ToolDefinition]) -> Decision:
+        if any(tool["name"] == "await_input" for tool in tools):
+            raise ModelError("await_input is reserved by OpenAIModel", kind="fatal")
         # Keep append-only history ahead of volatile operations to preserve cache prefixes.
         state = {}
         if "context" in snapshot:
@@ -114,12 +121,13 @@ class ChatModel:
                                 self.max_tokens * 2 ** min(snapshot.get("recoveries", 1), 4))
         system = PROTOCOL_PROMPT
         if snapshot.get("system_prompt"):
-            system += "\n\nHost instructions:\n" + snapshot["system_prompt"]
+            system += "\n\nApplication instructions:\n" + snapshot["system_prompt"]
         payload = {
             "model": self.settings.model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": json.dumps(state, ensure_ascii=False)}],
-            "tools": [*tools, WAIT_SCHEMA], "tool_choice": "auto",
+            "tools": [{"type": "function", "function": tool} for tool in tools] + [WAIT_SCHEMA],
+            "tool_choice": "auto",
             "max_tokens": output_tokens,
         }
         conversation = snapshot.get("conversation_id")
@@ -198,18 +206,23 @@ class ChatModel:
     async def _request(self, payload: dict) -> dict:
         import httpx
 
-        if self.settings.reasoning:
+        if self.settings.thinking is not None:
+            payload["thinking"] = {"type": "enabled" if self.settings.thinking else "disabled"}
+        if self.settings.reasoning and self.settings.thinking is not False:
             payload["reasoning_effort"] = self.settings.reasoning
         started = time.monotonic()
         headers = {"Authorization": f"Bearer {self.settings.api_key}"}
         if self.settings.provider == "tencent" and payload.get("prompt_cache_key"):
             headers["X-Session-ID"] = payload["prompt_cache_key"]
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
-                response = await client.post(
-                    f"{self.settings.base_url.rstrip('/')}/chat/completions", json=payload,
-                    headers=headers,
-                )
+            if self._closed:
+                raise ModelError("model is closed", kind="fatal")
+            if self._client is None:
+                self._client = httpx.AsyncClient(timeout=self.timeout, transport=self._transport)
+            response = await self._client.post(
+                f"{self.settings.base_url.rstrip('/')}/chat/completions", json=payload,
+                headers=headers, timeout=self.timeout,
+            )
             # Do not expose URLs, credentials, request headers, or gateway error bodies.
             if response.is_error:
                 self._record(payload, {"http_status": response.status_code}, started)
@@ -244,6 +257,14 @@ class ChatModel:
         if not isinstance(body, dict):
             raise ModelError("model response must be an object", kind="invalid_response", usage={})
         return body
+
+    async def aclose(self):
+        """Release model connections after all requests have stopped."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._client is not None:
+            await self._client.aclose()
 
     def _record(self, payload: dict, result: dict, started: float):
         if self.record_path:

@@ -8,7 +8,7 @@ import httpx
 from tests_helper import ControlledModel, event_of
 
 from aether import Agent, Call, ContextPolicy, Decision, Limits, ModelError, Summary, Tool
-from aether.chat import ChatModel, Settings
+from aether.adapters.openai import OpenAIModel, Settings
 from aether.context import Context, compact, json_bytes
 
 SMALL = ContextPolicy(input_bytes=2400, summary_bytes=200, overhead_bytes=200, keep_recent=2)
@@ -322,7 +322,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
     def model(self, handle):
-        return ChatModel(Settings("fake", "https://model.invalid/v1", "test", "test"),
+        return OpenAIModel(Settings("fake", "https://model.invalid/v1", "test", "test"),
                          transport=httpx.MockTransport(handle))
 
     def response(self, content="done", *, finish="stop", calls=None):

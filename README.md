@@ -2,116 +2,78 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-A small, message-driven runtime for LLM loops. Aether provides asynchronous submission, internal processing, queries and subscriptions, with continuous context, automatic compaction, tool registration and bounded model-error recovery. Python 3.11+; the core uses only the standard library. The terminal application lives in a separate repository.
+Aether is a message-driven kernel for LLM agents. It runs the loop between a model, tools and incoming messages, so an application can submit work, add information while it is running, and observe the result.
 
-[API reference (Chinese)](docs/api.md) · [Architecture (Chinese)](docs/architecture.md) · [Collaboration example](examples/collaboration.py)
+The model decides what to do next. Aether manages execution: conversation history, concurrent tool calls, waiting, cancellation, context compaction and bounded recovery. Each run processes state changes in order; model and tool requests execute outside that queue. A new message can invalidate an unfinished model decision before it produces output or starts tools.
 
-Run snapshots include maximum, used and remaining decision, tool, summary and recovery budgets; the default adapter forwards them to the model. Rejected tool batches can be corrected within the same bounded recovery allowance. Successful summary fragments are reused during recovery until input changes or compaction completes. An optional [scripted review example](examples/reviewed_research.py) shares one run's budget across generation, review and revision; it makes no real model requests. See [model workflows (Chinese)](docs/model-workflows.md) for composition and adapter boundaries.
+[Design](docs/design.md) · [API](docs/api.md) · [Model integration](docs/models.md) · [Working example](examples/follow_up.py)
 
-## Run with a real LLM
+## Getting started
 
-Clone the repository and install the optional HTTP adapter:
+Requires Python 3.11+. The runtime uses the standard library; the optional OpenAI-compatible connection uses HTTPX.
 
-```bash
+```sh
 git clone https://github.com/ruifengc/aether.git
 cd aether
-uv sync --extra live --no-dev
+uv sync --extra live
 ```
 
-Your application supplies model credentials and settings. The library does not discover environment variables or configuration files. In the example below, the application reads `LLM_API_KEY`, `LLM_BASE_URL` and `LLM_MODEL` from its environment. `LLM_BASE_URL` is the API root, such as `https://example.invalid/v1`.
-
-Save this as `chat.py`, configure those variables for your provider, and run `uv run --extra live --no-dev python chat.py`:
+Set `LLM_API_KEY`, `LLM_BASE_URL` and `LLM_MODEL` for your provider. The application reads these settings explicitly:
 
 ```python
 import asyncio
 import os
 
 from aether import Agent
-from aether.chat import ChatModel, Settings
+from aether.adapters import OpenAIModel, Settings
 
 
 async def main():
-    settings = Settings(
+    model = OpenAIModel(Settings(
         api_key=os.environ["LLM_API_KEY"],
         base_url=os.environ["LLM_BASE_URL"],
         model=os.environ["LLM_MODEL"],
-        provider="openai-compatible",
-        reasoning=None,  # Set a reasoning level if your provider supports one.
-    )
-    async with Agent(ChatModel(settings), system_prompt="Keep exact IDs.") as agent:
-        agent.register_prompt("Answer concisely.")
-        first = await agent.submit("Remember the fictional project ID ORBIT-17.")
-        await agent.wait(first.run_id)
-        second = await agent.submit("What was the project ID?",
-                                    conversation_id=first.conversation_id)
-        result = await agent.wait(second.run_id)
+    ))
+    async with Agent(model) as agent:
+        receipt = await agent.submit("Explain how a heat pump works.")
+        await agent.submit("Focus on heating a home in winter.", run_id=receipt.run_id)
+        result = await agent.wait(receipt.run_id)
         print(result["state"], result["output"])
 
 
 asyncio.run(main())
 ```
 
-This path makes real model requests and requires a reachable provider and its credentials. Set `provider="tencent"` to enable TokenHub-specific cache routing. Host instructions are registered before the first successful submission, count toward the input budget, and remain outside compressed history. Default library prompts are English; host text, user messages and tool results are preserved as supplied.
+`submit` returns once the input is accepted. `wait` waits for that run to finish. Queries and subscriptions let the application observe work without taking over its execution. Aether manages the model's HTTP connections and closes them when the Agent closes.
 
-## Scripted runtime example
+## Adding tools
 
-The collaboration example defaults to **fixed Python decisions, with no LLM inference**. `ScriptedAssistant` requests inventory for `SKU-A`, and a deterministic inventory service returns a quantity of 7. It checks the path from submission through tool execution, another participant's `submit`/`wait`, result delivery and final output. It does not demonstrate natural-language understanding or model quality.
-
-After installing the environment above, run it without network access:
-
-```bash
-uv run --offline --no-sync python examples/collaboration.py
-```
-
-Expected output: `7`. Installing or synchronizing dependencies for the first time may require network access; the scripted example itself makes no network requests.
-
-To replace the scripted assistant with a real TokenHub model, set `TOKENHUB_API_KEY` in the application's environment, then run:
-
-```bash
-uv run --extra live --no-dev python examples/collaboration.py --live
-```
-
-This live path calls `deepseek/deepseek-flash`. `TOKENHUB_BASE_URL` optionally overrides the API root; the example does not read another application's configuration file.
-
-## Models and tools
-
-A model implements `async decide(snapshot, tools) -> Decision`; inheritance is not required. `Model` and `Summarizer` protocols are exported from `aether`. A model reads `context` and returns `Call` objects; the runtime executes tools and returns their results. Compaction uses the model's `summarize` method or an explicit callable with the signature `async (previous, fragment, max_bytes) -> Summary`.
-
-Register ordinary functions as tools:
+A tool is a name, a description, a JSON parameter definition and an ordinary Python function. Register only the capabilities your application needs:
 
 ```python
-from aether import Agent, Tool
-from aether.tools import local_tools
+from aether import Tool
 
+async def stock(sku: str):
+    return {"sku": sku, "available": 7}
 
-def multiply(a: int, b: int):
-    return a * b
-
-
-custom = Tool("multiply", "Multiply two integers.", {
-    "type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-    "required": ["a", "b"], "additionalProperties": False,
-}, multiply)
-agent = Agent(my_model, tools=[custom])
-for tool in local_tools(".", include=("read_file", "search_files")):
-    agent.register_tool(tool)
+agent.register_tool(Tool("stock", "Read stock for a SKU.", {
+    "type": "object", "properties": {"sku": {"type": "string"}}, "required": ["sku"],
+}, stock))
 ```
 
-The library starts with no tools. `agent.tools` is read-only; add tools through `register_tool`. Synchronous handlers run in a thread pool; asynchronous handlers are awaited. A decision waits for its new tool batch by default. `Decision.wait_for` selects a subset, or `()` makes the batch nonblocking.
+The [follow-up example](examples/follow_up.py) uses a real model to select a device, then adds a weight requirement while its catalog tool is running. It demonstrates the same submission path for the initial task and the later requirement. It requires model credentials and makes billable API calls.
 
-`local_tools` provides `terminal`, `read_file`, `write_file`, `edit_file` and `search_files` when `include` is omitted; an empty sequence selects none. Construction does not execute commands, change the working directory or register tools. The path base is not a sandbox. Process tools currently target POSIX, with Bash for commands and `rg` for search.
+## Scope
 
-## Layout and development
+The kernel runs in one process and keeps state in memory. A conversation can continue across runs; each run has its own execution limits. Context compaction preserves recent messages and summarizes older history, with some loss of detail. Cancellation stops further processing but cannot undo completed external actions.
 
-Importable code lives in `src/aether`; tests, examples and documentation stay outside the installed package. This is the standard [src layout](https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/), which helps expose packaging errors instead of accidentally importing code from the repository root. `uv` installs the package before running it.
+Models implement the public `Model` interface. Provider request formatting belongs in model adapters; terminal interaction and application configuration belong in applications. The separate [Aether CLI](https://github.com/ruifengc/aether-cli) provides a terminal interface.
 
-```bash
+## Development
+
+```sh
 bash scripts/check.sh
 uv build
 ```
 
-Checks cover worktree and index credential scans, Ruff, runtime and tool tests, and the scripted collaboration and review examples. They do not require the CLI or the original experiment workspace. Initial dependency installation may need network access; these checks make no model requests. Source distributions include both READMEs, documentation, examples, tests and check scripts.
-
-Context budgets use `ContextPolicy(input_bytes=24000, summary_bytes=1200, overhead_bytes=2048)`: conservative UTF-8 byte counts. Model output limits (`max_tokens`/`max_output_tokens`) and actual `usage` remain token counts.
-
-Aether currently runs in one process with in-memory state. Summaries are lossy, and cancellation cannot undo external effects. Cross-process delivery and restart recovery remain future, demand-driven work.
+The checks cover runtime behavior, model protocol handling, local tools, code style and credential scanning. They do not call a real model. Public interfaces are in `contracts.py`; implementation is in `runtime.py`, `context.py` and `adapters/`.

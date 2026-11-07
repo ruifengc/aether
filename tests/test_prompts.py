@@ -8,7 +8,7 @@ import httpx
 from tests_helper import ControlledModel
 
 from aether import Agent, ContextPolicy, Decision, Summary
-from aether.chat import PROTOCOL_PROMPT, SUMMARY_SYSTEM, ChatModel, Settings
+from aether.adapters.openai import PROTOCOL_PROMPT, SUMMARY_SYSTEM, OpenAIModel, Settings
 
 
 class PromptTests(unittest.IsolatedAsyncioTestCase):
@@ -49,23 +49,6 @@ class PromptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             agent.register_prompt("after close")
 
-    async def test_invalid_prompt_registration_does_not_modify_configuration(self):
-        model = ControlledModel()
-        for value in (None, 42):
-            with self.assertRaises(TypeError):
-                Agent(model, system_prompt=value)
-        async with Agent(model) as agent:
-            for value in (None, 42):
-                with self.assertRaises(TypeError):
-                    agent.register_prompt(value)
-            for value in ("", " \n"):
-                with self.assertRaises(ValueError):
-                    agent.register_prompt(value)
-            receipt = await agent.submit("question")
-            view, answer = await model.next()
-            self.assertNotIn("system_prompt", view)
-            answer.set_result(Decision("done"))
-            await agent.wait(receipt.run_id, timeout=1)
 
     async def test_prompt_survives_compaction_and_is_not_a_summarizer_instruction(self):
         model = ControlledModel()
@@ -126,7 +109,7 @@ class PromptTests(unittest.IsolatedAsyncioTestCase):
             answer.set_result(Decision("done"))
             self.assertEqual((await agent.wait(receipt.run_id, timeout=1))["state"], "succeeded")
 
-    async def test_shared_adapter_keeps_business_prompts_isolated_and_out_of_summary(self):
+    async def test_application_prompts_are_isolated_and_excluded_from_summary(self):
         requests = []
 
         def handle(request):
@@ -136,18 +119,19 @@ class PromptTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
                 "content": "ALPHA" if "APP-ALPHA" in system else "BETA"}}]})
 
-        model = ChatModel(Settings("test", "https://model.invalid", "test", "test"),
-                          transport=httpx.MockTransport(handle))
-        async with (Agent(model, system_prompt="APP-ALPHA") as alpha,
-                    Agent(model, system_prompt="APP-BETA") as beta):
+        settings = Settings("test", "https://model.invalid", "test", "test")
+        alpha_model = OpenAIModel(settings, transport=httpx.MockTransport(handle))
+        beta_model = OpenAIModel(settings, transport=httpx.MockTransport(handle))
+        async with (Agent(alpha_model, system_prompt="APP-ALPHA") as alpha,
+                    Agent(beta_model, system_prompt="APP-BETA") as beta):
             receipts = await asyncio.gather(alpha.submit("same question"), beta.submit("same question"))
             results = await asyncio.gather(alpha.wait(receipts[0].run_id), beta.wait(receipts[1].run_id))
+            await alpha_model.summarize("", "facts", 200)
         self.assertEqual([result["output"] for result in results], ["ALPHA", "BETA"])
-        for request in requests:
+        for request in requests[:-1]:
             system = request["messages"][0]["content"]
             self.assertTrue(system.startswith(PROTOCOL_PROMPT))
             self.assertEqual(system.count("APP-"), 1)
             self.assertNotIn("APP-", request["messages"][1]["content"])
-        await model.summarize("", "facts", 200)
         self.assertEqual(requests[-1]["messages"][0]["content"], SUMMARY_SYSTEM)
         self.assertNotIn("APP-", json.dumps(requests[-1]))

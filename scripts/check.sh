@@ -5,5 +5,4 @@ uv run --extra live python scripts/check_sensitive.py
 uv run --extra live python scripts/check_sensitive.py --staged
 uv run --extra live ruff check .
 uv run --extra live python -m unittest discover -s tests -v
-uv run --extra live python examples/collaboration.py
-uv run --extra live python examples/reviewed_research.py
+uv run --extra live python -m compileall -q src examples

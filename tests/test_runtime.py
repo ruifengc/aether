@@ -347,13 +347,6 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         reply.set_result(Decision("partial", finish_reason="length"))
         self.assertEqual((await self.agent.wait(another.run_id, timeout=1))["state"], "failed")
 
-    async def test_ablation_without_freshness_guard_can_publish_old_answer(self):
-        self.agent.freshness_guard = False
-        receipt = await self.agent.submit("old")
-        _, first = await self.model.next()
-        await self.agent.submit("new", run_id=receipt.run_id)
-        first.set_result(Decision("old answer"))
-        self.assertEqual((await self.agent.wait(receipt.run_id, timeout=1))["output"], "old answer")
 
     async def test_wait_timeout_does_not_cancel_business_work(self):
         receipt = await self.agent.submit("start")

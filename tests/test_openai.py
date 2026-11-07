@@ -1,26 +1,111 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
-from aether.chat import ChatModel, Settings
+from aether import Agent
+from aether.adapters.openai import OpenAIModel, Settings
 from aether.errors import ModelError
 
 
-class ChatTests(unittest.IsolatedAsyncioTestCase):
+class OpenAIModelTests(unittest.IsolatedAsyncioTestCase):
     def settings(self):
         return Settings("test-credential", "https://model.invalid/v1", "test-model", "test", "low")
+
+    async def test_agent_reuses_and_closes_model_connections(self):
+        requests = []
+        closed = []
+
+        class Transport(httpx.MockTransport):
+            async def aclose(self):
+                closed.append(True)
+                await super().aclose()
+
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                                                        "message": {"content": "done"}}]})
+
+        model = OpenAIModel(self.settings(), transport=Transport(handle), timeout=7)
+        with patch("httpx.AsyncClient", wraps=httpx.AsyncClient) as clients:
+            async with Agent(model) as agent:
+                for question in ("first", "second"):
+                    receipt = await agent.submit(question)
+                    await agent.wait(receipt.run_id, timeout=1)
+                await model.summarize("", "fragment", 500)
+                self.assertEqual(closed, [])
+            self.assertEqual(clients.call_count, 1)
+        self.assertEqual(closed, [True])
+        await agent.close()
+        self.assertEqual(closed, [True])
+        with self.assertRaisesRegex(ModelError, "closed"):
+            await model.decide({"inputs": [], "pending": []}, [])
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(r.extensions["timeout"]["read"] == 7 for r in requests))
+
+    def make_model(self, *args, **kwargs):
+        model = OpenAIModel(*args, **kwargs)
+        self.addAsyncCleanup(model.aclose)
+        return model
+
+    async def test_shutdown_stops_request_before_closing_connection(self):
+        started = asyncio.Event()
+        order = []
+
+        async def handle(request):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                order.append("request stopped")
+
+        class Transport(httpx.MockTransport):
+            async def aclose(self):
+                order.append("connection closed")
+                await super().aclose()
+
+        async with Agent(self.make_model(self.settings(), transport=Transport(handle))) as agent:
+            receipt = await agent.submit("start")
+            await asyncio.wait_for(started.wait(), 1)
+            await agent.close()
+            self.assertEqual(agent.query(receipt.run_id)["state"], "cancelled")
+        self.assertEqual(order, ["request stopped", "connection closed"])
+
+    async def test_explicit_thinking_switch_controls_decisions_and_summary(self):
+        for thinking, effort in ((None, None), (None, "high"), (True, "high"), (False, "high")):
+            requests = []
+
+            def handle(request, requests=requests):
+                requests.append(json.loads(request.content))
+                return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
+                                                            "message": {"content": "done"}}]})
+
+            model = self.make_model(Settings("test", "https://model.invalid", "test", "deepseek",
+                                       effort, thinking), transport=httpx.MockTransport(handle))
+            await model.decide({"inputs": [], "pending": []}, [])
+            await model.summarize("", "fragment", 500)
+            for request in requests:
+                if thinking is None:
+                    self.assertNotIn("thinking", request)
+                else:
+                    self.assertEqual(request["thinking"]["type"],
+                                     "enabled" if thinking else "disabled")
+                self.assertEqual(request.get("reasoning_effort"),
+                                 None if thinking is False else effort)
+
 
     async def test_transport_timeout_is_classified_without_url_or_private_detail(self):
         def handle(request):
             raise httpx.ReadTimeout("private gateway URL", request=request)
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         with self.assertRaises(ModelError) as caught:
             await model.decide({"inputs": [], "pending": []}, [])
         self.assertEqual(caught.exception.kind, "transient")
@@ -28,7 +113,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_after_nonfinite_values_cannot_break_retry_scheduling(self):
         for value in ("nan", "inf", "-1", "not a number"):
-            model = ChatModel(self.settings(), transport=httpx.MockTransport(
+            model = self.make_model(self.settings(), transport=httpx.MockTransport(
                 lambda request, value=value: httpx.Response(429, headers={"retry-after": value})))
             with self.assertRaises(ModelError) as caught:
                 await model.decide({"inputs": [], "pending": []}, [])
@@ -45,11 +130,14 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                     "name": "lookup", "arguments": '{"id": "A"}'}}],
             }}], "usage": {"prompt_tokens": 10, "completion_tokens": 20}})
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         state = {"inputs": [{"source": "user", "content": "goal"},
                             {"source": "tool", "content": {"value": 1}}],
                  "pending": []}
-        reply = await model.decide(state, [])
+        definition = {"name": "lookup", "description": "Look up an ID.", "parameters": {
+            "type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}
+        reply = await model.decide(state, [definition])
+        self.assertEqual(captured[0]["tools"][0], {"type": "function", "function": definition})
         self.assertEqual(reply.calls[0].name, "lookup")
         self.assertEqual(reply.calls[0].arguments, {"id": "A"})
         self.assertIsNone(reply.wait_for)
@@ -65,7 +153,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                                              "arguments": "{}"}}],
             }}]})
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         reply = await model.decide({"inputs": [], "pending": []}, [])
         self.assertTrue(reply.wait)
         self.assertEqual(reply.content, "which city?")
@@ -77,7 +165,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                     "message": {"content": "partial result", "tool_calls": [{"function": {
                         "name": "await_input", "arguments": arguments}}]}}]})
 
-            model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+            model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
             if arguments == "{}":
                 reply = await model.decide({"inputs": [], "pending": []}, [])
                 self.assertTrue(reply.wait)
@@ -92,7 +180,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                 "tool_calls": [{"function": {"name": "await_input", "arguments": "{}"}}],
             }}]})
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         reply = await model.decide({"inputs": [], "pending": [{"id": "slow"}]}, [])
         self.assertTrue(reply.wait)
         self.assertEqual(reply.content, "")
@@ -104,7 +192,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                     {"function": {"name": "await_input", "arguments": '{"wait_for":[0,"old"]}'}},
                     {"function": {"name": "lookup", "arguments": '{"id":"A"}'}}]}}]})
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         reply = await model.decide({"inputs": [], "pending": [{"id": "old"}]}, [])
         self.assertFalse(reply.wait)
         self.assertEqual(reply.wait_for, (0, "old"))
@@ -120,7 +208,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                     "message": {"tool_calls": [{"function": {
                         "name": "await_input", "arguments": arguments}}] * count}}]})
 
-            model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+            model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
             with self.assertRaises(ModelError):
                 await model.decide({"inputs": [], "pending": []}, [])
 
@@ -131,7 +219,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                     {"function": {"name": "lookup", "arguments": '{"id":"A"}'}},
                     {"function": {"name": "await_input", "arguments": '{"wait_for":[]}'}}]}}]})
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         reply = await model.decide({"inputs": [], "pending": []}, [])
         self.assertEqual(reply.wait_for, ())
         self.assertFalse(reply.wait)
@@ -145,7 +233,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
                                                        "message": {"content": "done"}}]})
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         state = {"context": {"summary": "", "through": 0, "messages": [
             {"source": "user", "content": "goal"},
             {"source": "tool", "content": "long stable history " * 1000}]},
@@ -170,7 +258,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                                                        "message": {"content": "done"}}]})
 
         settings = Settings("test-credential", "https://model.invalid/v1", "test-model", "tencent")
-        model = ChatModel(settings, transport=httpx.MockTransport(handle))
+        model = self.make_model(settings, transport=httpx.MockTransport(handle))
         state = {"context": {"messages": []}, "pending": [],
                  "conversation_id": "conversation-A", "run_id": "run-one"}
         await model.decide(state, [])
@@ -196,7 +284,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"choices": [{"finish_reason": "stop",
                                                        "message": {"content": "done"}}]})
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         await model.decide({"inputs": [], "pending": [],
                             "conversation_id": "conversation-A"}, [])
         self.assertNotIn("prompt_cache_key", requests[0][0])
@@ -211,7 +299,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                                                        "message": {"content": "done"}}]})
 
         settings = Settings("test-credential", "https://model.invalid/v1", "test-model", "tencent")
-        model = ChatModel(settings, transport=httpx.MockTransport(handle))
+        model = self.make_model(settings, transport=httpx.MockTransport(handle))
         for conversation in ("中文会话", "中文会话", "line\nbreak"):
             await model.decide({"inputs": [], "pending": [],
                                 "conversation_id": conversation}, [])
@@ -228,7 +316,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "requests.jsonl"
-            model = ChatModel(self.settings(), transport=httpx.MockTransport(handle), record_path=path)
+            model = self.make_model(self.settings(), transport=httpx.MockTransport(handle), record_path=path)
             with self.assertRaisesRegex(RuntimeError, "model HTTP 401") as error:
                 await model.decide({"inputs": [], "pending": []}, [])
             self.assertNotIn("test-credential", str(error.exception))
@@ -240,8 +328,8 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         def handle(request):
             self.fail("configuration conflict must not send an HTTP request")
 
-        model = ChatModel(self.settings(), transport=httpx.MockTransport(handle))
+        model = self.make_model(self.settings(), transport=httpx.MockTransport(handle))
         with self.assertRaisesRegex(ModelError, "reserved") as error:
             await model.decide({"inputs": [], "pending": []}, [{
-                "type": "function", "function": {"name": "await_input"}}])
+                "name": "await_input", "description": "", "parameters": {}}])
         self.assertEqual(error.exception.kind, "fatal")

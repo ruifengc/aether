@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Protocol, TypedDict
 
 
 @dataclass(frozen=True)
@@ -25,8 +23,14 @@ class Decision:
     wait_for: tuple[int | str, ...] | None = None
 
 
+class ToolDefinition(TypedDict):
+    name: str
+    description: str
+    parameters: dict
+
+
 class Model(Protocol):
-    async def decide(self, snapshot: dict, tools: list[dict]) -> Decision: ...
+    async def decide(self, snapshot: dict, tools: list[ToolDefinition]) -> Decision: ...
 
 
 @dataclass(frozen=True)
@@ -35,18 +39,6 @@ class Tool:
     description: str
     parameters: dict
     handler: Callable
-
-    def schema(self) -> dict:
-        return {"type": "function", "function": {
-            "name": self.name, "description": self.description, "parameters": self.parameters,
-        }}
-
-    async def execute(self, arguments: dict) -> Any:
-        inspect.signature(self.handler).bind(**arguments)
-        if inspect.iscoroutinefunction(self.handler):
-            return await self.handler(**arguments)
-        result = await asyncio.to_thread(self.handler, **arguments)
-        return await result if inspect.isawaitable(result) else result
 
 
 @dataclass(frozen=True)
@@ -87,7 +79,6 @@ class Event:
     type: str
     data: dict
     at: float
-
 
 
 @dataclass(frozen=True)
